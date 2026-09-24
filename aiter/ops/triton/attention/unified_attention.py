@@ -155,7 +155,9 @@ def unified_attention(
     # backend
     backend: str | None = None,  # "triton" | "gluon"
 ):
-    assert causal, "Only causal attention is supported"
+    assert (
+        causal or not shuffled_kv_cache
+    ), "Non-causal attention is not supported with a pre-shuffled KV cache"
 
     if backend is None:
         backend = "gluon" if _is_gluon_available() else "triton"
@@ -455,6 +457,10 @@ def _unified_attention_2d_triton(params: _UAParams):
         ), "For A8W8 Unified Attention with pre-shuffled KV cache, only block_size >= 32 is supported"
 
     config = get_unified_attention_config("attn_2d", params, backend="triton")
+    if not params.causal:
+        # The unmasked bulk loop assumes a causal prefix, and no entry is
+        # tuned for non-causal, so fall back to the fully masked loop.
+        config["SPLIT_UNMASKED_LOOP"] = False
     config["BLOCK_M"] = max(
         config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv)
     )
@@ -517,6 +523,7 @@ def _unified_attention_2d_triton(params: _UAParams):
         ALL_DECODE=params.all_decode,
         SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
         K_WIDTH=params.k_width,
+        CAUSAL=params.causal,
         **config,
     )
 
@@ -596,6 +603,7 @@ def _unified_attention_3d_triton(
         IS_KV_FP8=(params.kv_cache_dtype == e4m3_dtype),
         NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
         TILE_SIZE=TILE_SIZE,
+        CAUSAL=params.causal,
         **config,
     )
 

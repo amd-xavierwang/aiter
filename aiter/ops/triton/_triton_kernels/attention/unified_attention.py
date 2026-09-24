@@ -72,6 +72,7 @@ _kernel_unified_attention_2d_repr = make_kernel_repr(
         "SHUFFLED_KV_CACHE",
         "SPLIT_UNMASKED_LOOP",
         "K_WIDTH",
+        "CAUSAL",
     ],
 )
 
@@ -128,10 +129,20 @@ def kernel_unified_attention_2d(
     SHUFFLED_KV_CACHE: tl.constexpr = False,  # bool
     SPLIT_UNMASKED_LOOP: tl.constexpr = False,  # bool
     K_WIDTH: tl.constexpr = 0,  # int
+    CAUSAL: tl.constexpr = True,  # bool
 ):
     tl.static_assert(
         not (SPLIT_UNMASKED_LOOP and SHUFFLED_KV_CACHE),
         "SPLIT_UNMASKED_LOOP is incompatible with SHUFFLED_KV_CACHE",
+    )
+    tl.static_assert(
+        CAUSAL or not SPLIT_UNMASKED_LOOP,
+        "SPLIT_UNMASKED_LOOP requires causal attention: without it a q-block "
+        "has no prefix of tiles that every row admits unmasked",
+    )
+    tl.static_assert(
+        CAUSAL or not SHUFFLED_KV_CACHE,
+        "Non-causal attention is not supported with a pre-shuffled KV cache",
     )
 
     kv_head_idx = tl.program_id(0)
@@ -237,16 +248,21 @@ def kernel_unified_attention_2d(
 
     # compute the length of the longest sequence prefix spanned by any
     # query token in the current q_block (q_block_local_idx)
-    max_seq_prefix_len = (
-        context_len
-        + q_block_local_idx * BLOCK_Q
-        + (BLOCK_M - 1) // num_queries_per_kv
-        + 1
-    )
+    if CAUSAL:
+        max_seq_prefix_len = (
+            context_len
+            + q_block_local_idx * BLOCK_Q
+            + (BLOCK_M - 1) // num_queries_per_kv
+            + 1
+        )
 
-    # adjust for potential padding in the last q_block by considering the
-    # actual sequence length
-    max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
+        # adjust for potential padding in the last q_block by considering the
+        # actual sequence length
+        max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
+    else:
+        # Keys may sit ahead of the query, so every tile up to seq_len is
+        # live. Slots past seq_len stay out: they are unwritten KV.
+        max_seq_prefix_len = seq_len
 
     # calculate the number of tiles that need to be processed to
     # cover the longest sequence prefix (due to causal masking, tiles beyond
@@ -269,8 +285,13 @@ def kernel_unified_attention_2d(
         # where q_abs = context_len + q
         # The union of allowed key positions for this Q-block is:
         # [context_len + qpos_lo - SLIDING_WINDOW + 1, context_len + qpos_hi]
+        # A non-causal window reaches the same distance to the right, so the
+        # union ends SLIDING_WINDOW - 1 keys past qpos_hi.
         first_allowed_key = context_len + qpos_lo - SLIDING_WINDOW + 1
-        last_allowed_key = context_len + qpos_hi
+        if CAUSAL:
+            last_allowed_key = context_len + qpos_hi
+        else:
+            last_allowed_key = context_len + qpos_hi + SLIDING_WINDOW - 1
         # Convert to tile indices and clamp
         tile_start = tl.maximum(0, first_allowed_key // TILE_SIZE)
         tile_end = tl.minimum((last_allowed_key // TILE_SIZE) + 1, num_tiles)
@@ -456,18 +477,25 @@ def kernel_unified_attention_2d(
             # softcap here uses exp2 and consumes RCP_LN2 conversion.
             # multiply by RCP_LN2 again to be used in later exp2
             S = apply_softcap(S, softcap) * RCP_LN2
-        seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
+        if CAUSAL:
+            seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
+        else:
+            seq_mask = seq_offset[None, :] < seq_len
 
         S = tl.where(
             query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
         )
 
         if SLIDING_WINDOW > 0:
-            S = tl.where(
-                (context_len + query_pos[:, None] - seq_offset) < SLIDING_WINDOW,
-                S,
-                float("-inf"),
-            )
+            sw_mask = (context_len + query_pos[:, None] - seq_offset) < SLIDING_WINDOW
+            if not CAUSAL:
+                # The window is two-sided once keys ahead of the query are
+                # admissible: |q_abs - k| < SLIDING_WINDOW.
+                sw_mask = sw_mask & (
+                    (seq_offset[None, :] - context_len - query_pos[:, None])
+                    < SLIDING_WINDOW
+                )
+            S = tl.where(sw_mask, S, float("-inf"))
 
         if USE_ALIBI_SLOPES:
             # prescale w. RCP_LN2 for later exp2
@@ -555,6 +583,7 @@ kernel_unified_attention_3d_repr = make_kernel_repr(
         "SHUFFLED_KV_CACHE",
         "IS_Q_FP8",
         "IS_KV_FP8",
+        "CAUSAL",
     ],
 )
 
@@ -615,7 +644,12 @@ def kernel_unified_attention_3d(
     K_WIDTH: tl.constexpr = 0,  # int
     IS_Q_FP8: tl.constexpr = False,  # bool
     IS_KV_FP8: tl.constexpr = False,  # bool
+    CAUSAL: tl.constexpr = True,  # bool
 ):
+    tl.static_assert(
+        CAUSAL or not SHUFFLED_KV_CACHE,
+        "Non-causal attention is not supported with a pre-shuffled KV cache",
+    )
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
     segm_idx = tl.program_id(2)
@@ -726,16 +760,21 @@ def kernel_unified_attention_3d(
 
     # compute the length of the longest sequence prefix spanned by any
     # query token in the current q_block (q_block_local_idx)
-    max_seq_prefix_len = (
-        context_len
-        + q_block_local_idx * BLOCK_Q
-        + (BLOCK_M - 1) // num_queries_per_kv
-        + 1
-    )
+    if CAUSAL:
+        max_seq_prefix_len = (
+            context_len
+            + q_block_local_idx * BLOCK_Q
+            + (BLOCK_M - 1) // num_queries_per_kv
+            + 1
+        )
 
-    # adjust for potential padding in the last q_block by considering the
-    # actual sequence length
-    max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
+        # adjust for potential padding in the last q_block by considering the
+        # actual sequence length
+        max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
+    else:
+        # Keys may sit ahead of the query, so every tile up to seq_len is
+        # live. Slots past seq_len stay out: they are unwritten KV.
+        max_seq_prefix_len = seq_len
 
     # calculate the number of tiles that need to be processed to
     # cover the longest sequence prefix (due to causal masking, tiles beyond
@@ -854,7 +893,10 @@ def kernel_unified_attention_3d(
                 .reshape(TILE_SIZE, HEAD_SIZE_PADDED)
             )
 
-        seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
+        if CAUSAL:
+            seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
+        else:
+            seq_mask = seq_offset[None, :] < seq_len
 
         # S : (BLOCK_M, TILE_SIZE)
         # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
@@ -870,11 +912,15 @@ def kernel_unified_attention_3d(
         )
 
         if SLIDING_WINDOW > 0:
-            S = tl.where(
-                (context_len + query_pos[:, None] - seq_offset) < SLIDING_WINDOW,
-                S,
-                float("-inf"),
-            )
+            sw_mask = (context_len + query_pos[:, None] - seq_offset) < SLIDING_WINDOW
+            if not CAUSAL:
+                # The window is two-sided once keys ahead of the query are
+                # admissible: |q_abs - k| < SLIDING_WINDOW.
+                sw_mask = sw_mask & (
+                    (seq_offset[None, :] - context_len - query_pos[:, None])
+                    < SLIDING_WINDOW
+                )
+            S = tl.where(sw_mask, S, float("-inf"))
 
         if USE_ALIBI_SLOPES:
             # prescale w. RCP_LN2 for later exp2
